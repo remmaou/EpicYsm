@@ -1,0 +1,51 @@
+plugins {
+    id 'fabric-loom' version '1.11.8'
+}
+
+version = project.mod_version
+group = 'net.okitsu.ysmepicfightcompat'
+base { archivesName = 'ysm-epicfight-compat-fabric' }
+
+repositories {
+    maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+    maven { name = 'Fuzs Mod Resources'; url = 'https://raw.githubusercontent.com/Fuzss/modresources/main/maven/' }
+    maven { url = 'https://maven.terraformersmc.com/' }
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+    annotationProcessor "net.fabricmc:sponge-mixin:0.15.4+mixin.0.8.7"
+    modCompileOnly "fuzs.forgeconfigapiport:forgeconfigapiport-fabric:${project.forgeconfigapiport_version}"
+    compileOnly "org.jetbrains:annotations:26.0.1"
+    compileOnly "com.google.code.findbugs:jsr305:3.0.2"
+
+    // Library yang di versi NeoForge dibawa lewat jarJar / disediakan NeoForge
+    implementation 'com.github.luben:zstd-jni:1.5.6-3'
+    include 'com.github.luben:zstd-jni:1.5.6-3'
+    compileOnly 'com.electronwill.night-config:core:3.8.0'
+    compileOnly 'com.electronwill.night-config:toml:3.8.0'
+
+    // Epic Fight (port Fabric) dan Fox Model Loader (mod id yes_steve_model): jar ada di folder libs/
+    modCompileOnly files(fileTree(dir: 'libs', include: 'epicfight-fabric*.jar'))
+    modCompileOnly files(fileTree(dir: 'libs', include: 'fox-model-loader*.jar'))
+}
+
+mixin {
+    defaultRefmapName = 'ysm_epicfight_compat.refmap.json'
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') { expand 'version': project.version }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 21
+    // Tampilkan SEMUA error sekaligus (bukan berhenti di fase simbol), supaya satu log cukup untuk satu putaran perbaikan
+    it.options.compilerArgs += ['-Xmaxerrs', '10000', '-Xmaxwarns', '200', '-XDshould-stop.ifError=FLOW']
+}
+java { sourceCompatibility = JavaVersion.VERSION_21; targetCompatibility = JavaVersion.VERSION_21 }
