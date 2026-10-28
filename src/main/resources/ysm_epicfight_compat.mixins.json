@@ -1,0 +1,27 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "net.okitsu.ysmepicfightcompat.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "AttackAnimationSoundMixin"
+  ],
+  "client": [
+    "AttachmentArmatureMixin",
+    "CombatFirstPersonMixin",
+    "CompositeRenderStateAccessor$State",
+    "CompositeRenderTypeAccessor",
+    "FirstPersonArmorGateMixin",
+    "FirstPersonRenderScopeMixin",
+    "HeldItemCorrectionMixin",
+    "InventoryRenderScopeMixin",
+    "OutlineBufferSourceAccessor",
+    "PatchedItemInHandLayerMixin",
+    "PatchedLivingEntityRendererMixin",
+    "RenderTypeSortingAccessor",
+    "TridentHeldItemCorrectionMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

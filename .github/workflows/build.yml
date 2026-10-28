@@ -1,0 +1,42 @@
+name: Build YSM Epic Fight Compat (Fabric)
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew build --stacktrace --no-daemon 2>&1 | tee build.log
+      - name: Ringkas error
+        if: always()
+        run: |
+          {
+            echo "Jumlah error kompilasi: $(grep -c 'error:' build.log || true)"
+            echo '```'
+            grep -E 'error:|What went wrong' -A3 build.log | sed -E 's#.*/src/main/java/##' | cut -c1-220 | head -150
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: build.log
+      - uses: actions/upload-artifact@v4
+        if: steps.build.outcome == 'success'
+        with:
+          name: ysm-epicfight-compat-jar
+          path: build/libs/*.jar
+      - if: steps.build.outcome != 'success'
+        run: exit 1

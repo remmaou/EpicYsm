@@ -1,0 +1,601 @@
+package net.okitsu.ysmepicfightcompat.animation;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
+
+/** Per-entity state-machine evaluator for the supported YSM controller subset. */
+final class AnimationControllerProgram {
+    private static final double EPSILON = 0.0001D;
+    private static final String BUILTIN_STATE = "ysm-builtin";
+    private static final int MAX_EMPTY_STATE_TRANSITIONS = 256;
+    private static final int ANY_FINISHED = ExpressionEngine.querySlot(
+            "query.any_animation_finished");
+    private static final int ALL_FINISHED = ExpressionEngine.querySlot(
+            "query.all_animations_finished");
+
+    record ClipInfo(float duration, AnimationClip.Playback playback, boolean renderable) {
+        ClipInfo(float duration, AnimationClip.Playback playback) {
+            this(duration, playback, true);
+        }
+    }
+
+    /** A current-state provider selection; old poses are snapshots, not executable clips. */
+    record BuiltinSlot(String controllerName, String stateName, long generation,
+                       float progress, boolean builtin, List<ActiveAnimation> animations) {
+        BuiltinSlot {
+            animations = animations == null ? List.of() : List.copyOf(animations);
+        }
+    }
+
+    record ActiveAnimation(String controllerName, String instanceKey,
+                           String name, double elapsed,
+                           float weight, boolean blendViaShortestPath,
+                           Map<Integer, Double> stateVariables, BuiltinSlot builtinSlot) {
+        ActiveAnimation(String controllerName, String instanceKey, String name,
+                        double elapsed, float weight, boolean blendViaShortestPath,
+                        Map<Integer, Double> stateVariables) {
+            this(controllerName, instanceKey, name, elapsed, weight,
+                    blendViaShortestPath, stateVariables, null);
+        }
+
+        ActiveAnimation {
+            stateVariables = stateVariables == null ? Map.of() : Map.copyOf(stateVariables);
+        }
+    }
+
+    /**
+     * One controller step viewed through two independent concerns. {@code allActive}
+     * is used for state/edge observation even while a remote held-item preference is
+     * unknown or disabled; {@code outputActive} is the subset allowed to affect the
+     * rendered pose. State effects have their own permission predicate so a
+     * native visual consumer need not enable previously disabled external outputs.
+     */
+    record Selection(List<ActiveAnimation> outputActive,
+                     List<ActiveAnimation> allActive) {
+        Selection {
+            outputActive = List.copyOf(outputActive);
+            allActive = List.copyOf(allActive);
+        }
+    }
+
+    static final class RuntimeState {
+        private final Map<String, ControllerRuntime> controllers = new LinkedHashMap<>();
+
+        void reset() {
+            controllers.clear();
+        }
+    }
+
+    private record Completion(boolean any, boolean all) {
+        private static final Completion NONE = new Completion(false, false);
+    }
+
+    private record PreviousState(AnimationController.State state, double enteredAt,
+                                 long generation, double transitionStartedAt,
+                                 AnimationController.BlendTransition blend) {
+    }
+
+    private static final class ControllerRuntime {
+        private AnimationController.State current;
+        private double enteredAt;
+        private long generation;
+        private double lastStepAt = Double.NEGATIVE_INFINITY;
+        private PreviousState previous;
+
+        private void initialize(AnimationController controller, double now,
+                                ControllerEnvironment environment) {
+            current = initialState(controller);
+            enteredAt = now;
+            generation++;
+            lastStepAt = now;
+            environment.completion(Completion.NONE);
+            environment.beginState(current);
+            execute(current == null ? List.of() : current.onEntry(), environment);
+            environment.playSounds(current == null ? List.of() : current.soundEffects());
+            environment.playParticles(current == null
+                    ? List.of() : current.particleEffects());
+        }
+    }
+
+    private final class ControllerEnvironment implements MolangScriptRuntime.Host {
+        private final ExpressionEngine.Environment delegate;
+        private final ExpressionEngine.Environment poseOnlyExpressions;
+        private Completion completion = Completion.NONE;
+        private String soundScope = "controller";
+        private boolean outputsEnabled = true;
+        private boolean stateEffectsEnabled = true;
+        private final Map<Integer, Double> stateVariables = new LinkedHashMap<>();
+
+        private ControllerEnvironment(ExpressionEngine.Environment delegate) {
+            this.delegate = delegate;
+            poseOnlyExpressions = ParallelAnimationProgram.poseOnlyEnvironment(this);
+        }
+
+        @Override public MolangScriptRuntime scripts() { return MolangScriptRuntime.scripts(delegate); }
+        @Override public boolean externalOutputsEnabled() {
+            return (!outputsEnabled || stateEffectsEnabled)
+                    && MolangScriptRuntime.externalOutputsEnabled(delegate);
+        }
+        @Override public Object readVariableValue(int slot) {
+            return stateVariables.containsKey(slot) ? stateVariables.get(slot) : delegate.readVariableValue(slot);
+        }
+        @Override public void writeVariableValue(int slot, Object value) {
+            if (stateVariables.containsKey(slot)) writeVariable(slot, ExpressionEngine.number(value));
+            else delegate.writeVariableValue(slot, value);
+        }
+        @Override public Object readQueryValue(int slot) {
+            if (slot == ANY_FINISHED || slot == ALL_FINISHED) return readQuery(slot);
+            MolangScriptRuntime runtime = scripts();
+            Object value = runtime == null ? MolangScriptRuntime.UNHANDLED
+                    : runtime.read(ExpressionEngine.slotName(slot), this);
+            return value == MolangScriptRuntime.UNHANDLED ? delegate.readQueryValue(slot) : value;
+        }
+        @Override public Object invokeValue(String name, Object[] arguments) {
+            MolangScriptRuntime runtime = scripts();
+            Object value = runtime == null ? MolangScriptRuntime.UNHANDLED : runtime.invoke(name, arguments, this);
+            return value == MolangScriptRuntime.UNHANDLED ? delegate.invokeValue(name, arguments) : value;
+        }
+
+        private void completion(Completion value) {
+            completion = value == null ? Completion.NONE : value;
+        }
+
+        private void soundScope(String scope) {
+            soundScope = scope;
+            if (delegate instanceof EntityAnimationEnvironment entityEnvironment) {
+                entityEnvironment.soundScope(scope);
+            }
+        }
+
+        private void outputsEnabled(boolean poseOutputs, boolean stateEffects) {
+            outputsEnabled = poseOutputs;
+            stateEffectsEnabled = stateEffects;
+        }
+
+        private ExpressionEngine.Environment expressions() {
+            return outputsEnabled && !stateEffectsEnabled ? poseOnlyExpressions : this;
+        }
+
+        private ExpressionEngine.Expression compiledExpression(String source) {
+            return source == null ? ExpressionEngine.compile(null)
+                    : compiledExpressions.computeIfAbsent(source, ExpressionEngine::compile);
+        }
+
+        private void stopOutputScope() {
+            if (delegate instanceof EntityAnimationEnvironment entityEnvironment) {
+                entityEnvironment.stopSoundScope(soundScope);
+                entityEnvironment.stopParticleScope(soundScope);
+            }
+        }
+
+        private void playSounds(List<String> effects) {
+            if (stateEffectsEnabled
+                    && delegate instanceof EntityAnimationEnvironment entityEnvironment) {
+                effects.forEach(entityEnvironment::playSoundEffect);
+            }
+        }
+
+        private void playParticles(List<DeclarativeParticleEffect> effects) {
+            if (stateEffectsEnabled
+                    && delegate instanceof EntityAnimationEnvironment entityEnvironment) {
+                effects.forEach(effect -> entityEnvironment.playParticleEffect(effect, true));
+            }
+        }
+
+        private void beginState(AnimationController.State state) {
+            stateVariables.clear();
+            if (state == null) {
+                return;
+            }
+            for (AnimationController.StateVariable variable : state.variables()) {
+                int slot = ExpressionEngine.slot(variable.name());
+                double input = compiledExpression(variable.inputExpression())
+                        .evaluate(expressions());
+                double value = variable.remap(input);
+                stateVariables.put(slot, Double.isFinite(value) ? value : 0.0D);
+            }
+        }
+
+        private Map<Integer, Double> stateVariables() {
+            return Map.copyOf(stateVariables);
+        }
+
+        @Override
+        public double readVariable(int slot) {
+            return stateVariables.containsKey(slot)
+                    ? stateVariables.get(slot) : delegate.readVariable(slot);
+        }
+
+        @Override
+        public boolean hasVariable(int slot) {
+            return stateVariables.containsKey(slot) || delegate.hasVariable(slot);
+        }
+
+        @Override
+        public void writeVariable(int slot, double value) {
+            if (stateVariables.containsKey(slot)) {
+                stateVariables.put(slot, Double.isFinite(value) ? value : 0.0D);
+            } else {
+                delegate.writeVariable(slot, value);
+            }
+        }
+
+        @Override
+        public double readQuery(int slot) {
+            if (slot == ANY_FINISHED) {
+                return completion.any() ? 1.0D : 0.0D;
+            }
+            if (slot == ALL_FINISHED) {
+                return completion.all() ? 1.0D : 0.0D;
+            }
+            return delegate.readQuery(slot);
+        }
+
+        @Override
+        public double invoke(String name, double[] arguments) {
+            return delegate.invoke(name, arguments);
+        }
+
+        @Override
+        public double invokeWithText(String name, String[] arguments) {
+            return delegate.invokeWithText(name, arguments);
+        }
+
+        @Override
+        public double invokeWithMixedArguments(String name, String[] textArguments,
+                                               double[] numericArguments) {
+            return delegate.invokeWithMixedArguments(name, textArguments, numericArguments);
+        }
+    }
+
+    private final Map<String, AnimationController> controllers;
+    private final Set<String> builtinControllers;
+    private final Map<String, ClipInfo> clips;
+    // Retain handles for this immutable controller definition even after the global
+    // compiler cache fills. Only reached expressions are compiled; values stay per entity.
+    private final Map<String, ExpressionEngine.Expression> compiledExpressions =
+            new ConcurrentHashMap<>();
+
+    AnimationControllerProgram(Map<String, AnimationController> controllers,
+                               Map<String, ClipInfo> clips) {
+        this(controllers, clips, Set.of());
+    }
+
+    AnimationControllerProgram(Map<String, AnimationController> controllers,
+                               Map<String, ClipInfo> clips,
+                               Set<String> allowedHandItemControllers) {
+        Set<String> allowed = allowedHandItemControllers == null ? Set.of()
+                : allowedHandItemControllers.stream()
+                .map(AnimationControllerProgram::normalize)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        Map<String, AnimationController> retained = new LinkedHashMap<>();
+        if (controllers != null) {
+            controllers.forEach((name, controller) -> {
+                if (controller != null && !controller.states().isEmpty()
+                        && (!isHandItemController(name) || ControllerOrder.dynamic(name)
+                        || allowed.contains(normalize(name)))) {
+                    retained.putIfAbsent(name, controller);
+                }
+            });
+        }
+        Map<String, AnimationController> ordered = new LinkedHashMap<>();
+        retained.keySet().stream().sorted(ControllerOrder.comparator())
+                .forEach(name -> ordered.put(name, retained.get(name)));
+        this.controllers = Collections.unmodifiableMap(ordered);
+        builtinControllers = retained.entrySet().stream()
+                .filter(entry -> ParallelAnimationProgram.supportsScriptController(entry.getKey())
+                        && entry.getValue().states().containsKey(BUILTIN_STATE))
+                .map(Map.Entry::getKey)
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        this.clips = clips == null ? Map.of()
+                : Collections.unmodifiableMap(new LinkedHashMap<>(clips));
+    }
+
+    boolean isEmpty() {
+        return controllers.isEmpty();
+    }
+
+    boolean hasController(String name) {
+        String normalized = channelKey(name);
+        return controllers.keySet().stream().anyMatch(key ->
+                channelKey(key).equals(normalized));
+    }
+
+    boolean hasBuiltinController(String name) {
+        if (builtinControllers.isEmpty()) return false;
+        String normalized = channelKey(name);
+        return builtinControllers.stream().anyMatch(key -> channelKey(key).equals(normalized));
+    }
+
+    boolean hasBuiltinControllers() {
+        return !builtinControllers.isEmpty();
+    }
+
+    boolean builtinActive(String name, RuntimeState runtimeState) {
+        if (runtimeState == null) return false;
+        String normalized = channelKey(name);
+        return builtinControllers.stream().anyMatch(key -> {
+            ControllerRuntime runtime = runtimeState.controllers.get(key);
+            return channelKey(key).equals(normalized) && runtime != null
+                    && isBuiltin(runtime.current);
+        });
+    }
+
+    /** Resolve managed state machines before their same-slot script providers run. */
+    void prepareBuiltins(double now, ExpressionEngine.Environment environment,
+                         RuntimeState runtimeState, Predicate<String> outputsEnabled) {
+        prepareBuiltins(now, environment, runtimeState, outputsEnabled, outputsEnabled);
+    }
+
+    void prepareBuiltins(double now, ExpressionEngine.Environment environment,
+                         RuntimeState runtimeState, Predicate<String> poseOutputs,
+                         Predicate<String> stateEffects) {
+        if (builtinControllers.isEmpty()) return;
+        ControllerEnvironment controllerEnvironment = new ControllerEnvironment(environment);
+        for (Map.Entry<String, AnimationController> entry : controllers.entrySet()) {
+            if (builtinControllers.contains(entry.getKey())) {
+                prepareController(entry.getKey(), entry.getValue(), now,
+                        controllerEnvironment, runtimeState, poseOutputs, stateEffects);
+            }
+        }
+    }
+
+    List<ActiveAnimation> select(double now, ExpressionEngine.Environment environment,
+                                 RuntimeState runtimeState) {
+        return select(now, environment, runtimeState, ignored -> true);
+    }
+
+    List<ActiveAnimation> select(double now, ExpressionEngine.Environment environment,
+                                 RuntimeState runtimeState,
+                                 Predicate<String> outputsEnabled) {
+        return selectObserved(now, environment, runtimeState, outputsEnabled).outputActive();
+    }
+
+    Selection selectObserved(double now, ExpressionEngine.Environment environment,
+                             RuntimeState runtimeState,
+                             Predicate<String> outputsEnabled) {
+        return selectObserved(now, environment, runtimeState, outputsEnabled, outputsEnabled);
+    }
+
+    /** Pose-only consumers may observe a state without enabling its external effects. */
+    Selection selectObserved(double now, ExpressionEngine.Environment environment,
+                             RuntimeState runtimeState, Predicate<String> poseOutputs,
+                             Predicate<String> stateEffects) {
+        if (controllers.isEmpty()) {
+            return new Selection(List.of(), List.of());
+        }
+        ControllerEnvironment controllerEnvironment = new ControllerEnvironment(environment);
+        List<ActiveAnimation> output = new ArrayList<>();
+        List<ActiveAnimation> observed = new ArrayList<>();
+        for (Map.Entry<String, AnimationController> entry : controllers.entrySet()) {
+            String controllerName = entry.getKey();
+            AnimationController controller = entry.getValue();
+            ControllerRuntime runtime = prepareController(controllerName, controller, now,
+                    controllerEnvironment, runtimeState, poseOutputs, stateEffects);
+            boolean enabled = controllerEnvironment.outputsEnabled;
+            int first = observed.size();
+            appendActive(observed, controllerName, runtime, now, controllerEnvironment);
+            if (enabled && observed.size() > first) {
+                output.addAll(observed.subList(first, observed.size()));
+            }
+        }
+        return new Selection(output, observed);
+    }
+
+    private ControllerRuntime prepareController(String name, AnimationController controller,
+            double now, ControllerEnvironment environment, RuntimeState runtimeState,
+            Predicate<String> poseOutputs, Predicate<String> stateEffects) {
+        environment.outputsEnabled(poseOutputs == null || poseOutputs.test(normalize(name)),
+                stateEffects == null || stateEffects.test(normalize(name)));
+        environment.soundScope("controller/" + name);
+        ControllerRuntime runtime = runtimeState.controllers.computeIfAbsent(
+                name, ignored -> new ControllerRuntime());
+        if (runtime.current == null) {
+            runtime.initialize(controller, now, environment);
+        } else if (now > runtime.lastStepAt + EPSILON) {
+            advance(controller, runtime, now, environment);
+        }
+        return runtime;
+    }
+
+    Set<String> activeKeys(List<ActiveAnimation> active) {
+        Set<String> result = new LinkedHashSet<>();
+        active.forEach(animation -> result.add(animation.instanceKey()));
+        return result;
+    }
+
+    private void advance(AnimationController controller, ControllerRuntime runtime,
+                         double now, ControllerEnvironment environment) {
+        runtime.lastStepAt = now;
+        if (runtime.previous != null
+                && now - runtime.previous.transitionStartedAt()
+                >= runtime.previous.blend().duration()) {
+            runtime.previous = null;
+        }
+        Set<String> visited = new LinkedHashSet<>();
+        visited.add(runtime.current.name());
+        int limit = Math.min(MAX_EMPTY_STATE_TRANSITIONS, controller.states().size());
+        for (int step = 0; step < limit; step++) {
+            environment.beginState(runtime.current);
+            environment.completion(completion(runtime.current,
+                    Math.max(0.0D, now - runtime.enteredAt), environment));
+            AnimationController.State target = null;
+            for (AnimationController.Transition transition : runtime.current.transitions()) {
+                AnimationController.State candidate = controller.states().get(transition.targetState());
+                if (candidate != null && truth(environment.compiledExpression(
+                        transition.conditionExpression()).evaluate(environment.expressions()))) {
+                    target = candidate;
+                    break;
+                }
+            }
+            if (target == null || visited.contains(target.name())
+                    && (step > 0 || isEmptyState(target))) return;
+            environment.stopOutputScope();
+            execute(runtime.current.onExit(), environment);
+            AnimationController.BlendTransition blend = target.blendTransition();
+            runtime.previous = blend.duration() > EPSILON
+                    ? new PreviousState(runtime.current, runtime.enteredAt, runtime.generation,
+                    now, blend) : null;
+            runtime.current = target;
+            runtime.enteredAt = now;
+            runtime.generation++;
+            environment.completion(Completion.NONE);
+            environment.beginState(target);
+            execute(target.onEntry(), environment);
+            environment.playSounds(target.soundEffects());
+            environment.playParticles(target.particleEffects());
+            if (!isEmptyState(target)) return;
+            visited.add(target.name());
+        }
+    }
+
+    private void appendActive(List<ActiveAnimation> result, String controllerName,
+                              ControllerRuntime runtime, double now,
+                              ControllerEnvironment environment) {
+        if (builtinControllers.contains(controllerName)) {
+            float progress = runtime.previous == null ? 1.0F
+                    : runtime.previous.blend().progress(
+                    Math.max(0.0D, now - runtime.previous.transitionStartedAt()));
+            if (progress >= 1.0F) runtime.previous = null;
+            List<ActiveAnimation> current = new ArrayList<>();
+            double elapsed = Math.max(0.0D, now - runtime.enteredAt);
+            appendState(current, controllerName, runtime.current, runtime.generation,
+                    elapsed, 1.0F, false, environment);
+            result.addAll(current);
+            String normalized = normalize(controllerName);
+            BuiltinSlot slot = new BuiltinSlot(normalized, runtime.current.name(),
+                    runtime.generation, progress, isBuiltin(runtime.current), current);
+            result.add(new ActiveAnimation(controllerName, "controller/" + controllerName + '/'
+                    + runtime.current.name() + '/' + runtime.generation + "/slot", "", elapsed,
+                    1.0F, runtime.current.blendViaShortestPath(),
+                    environment.stateVariables(), slot));
+            return;
+        }
+        float incomingWeight = 1.0F;
+        if (runtime.previous != null) {
+            double transitionElapsed = Math.max(0.0D,
+                    now - runtime.previous.transitionStartedAt());
+            incomingWeight = runtime.previous.blend().progress(transitionElapsed);
+            appendState(result, controllerName, runtime.previous.state(),
+                    runtime.previous.generation(),
+                    Math.max(0.0D, now - runtime.previous.enteredAt()),
+                    1.0F, false, environment);
+            if (incomingWeight >= 1.0F) {
+                runtime.previous = null;
+            }
+        }
+        appendState(result, controllerName, runtime.current, runtime.generation,
+                Math.max(0.0D, now - runtime.enteredAt), incomingWeight,
+                runtime.previous != null
+                        && runtime.current.blendViaShortestPath(), environment);
+    }
+
+    private void appendState(List<ActiveAnimation> result, String controllerName,
+                             AnimationController.State state, long generation,
+                             double elapsed, float transitionWeight, boolean shortestPath,
+                             ControllerEnvironment environment) {
+        if (state == null) {
+            return;
+        }
+        environment.beginState(state);
+        environment.completion(completion(state, elapsed, environment));
+        if (isBuiltin(state)) return;
+        for (int index = 0; index < state.animations().size(); index++) {
+            AnimationController.AnimationReference reference = state.animations().get(index);
+            String normalized = normalize(reference.name());
+            ClipInfo clip = clips.get(normalized);
+            if (clip == null || !clip.renderable()) {
+                continue;
+            }
+            double evaluated = environment.compiledExpression(reference.weightExpression())
+                    .evaluate(environment.expressions());
+            float weight = finite(evaluated * transitionWeight);
+            String key = "controller/" + controllerName + '/' + state.name() + '/'
+                    + generation + '/' + index;
+            result.add(new ActiveAnimation(controllerName, key,
+                    normalized, elapsed, weight,
+                    shortestPath, environment.stateVariables()));
+        }
+    }
+
+    private Completion completion(AnimationController.State state, double elapsed,
+                                  ControllerEnvironment environment) {
+        if (state == null) {
+            return Completion.NONE;
+        }
+        if (isBuiltin(state)) return new Completion(true, true);
+        boolean any = false;
+        boolean all = true;
+        boolean active = false;
+        environment.completion(Completion.NONE);
+        for (AnimationController.AnimationReference reference : state.animations()) {
+            String name = normalize(reference.name());
+            ClipInfo clip = clips.get(name);
+            if (clip == null || !truth(environment.compiledExpression(
+                    reference.weightExpression()).evaluate(environment.expressions()))) {
+                continue;
+            }
+            active = true;
+            boolean finished = clip.duration() <= EPSILON ? elapsed > EPSILON
+                    : elapsed + EPSILON >= clip.duration();
+            any |= finished;
+            all &= finished;
+        }
+        return active ? new Completion(any, all) : new Completion(true, true);
+    }
+
+    private static AnimationController.State initialState(AnimationController controller) {
+        AnimationController.State explicit = controller.states().get(controller.initialState());
+        if (explicit != null) {
+            return explicit;
+        }
+        AnimationController.State defaultState = controller.states().get("default");
+        return defaultState != null ? defaultState
+                : controller.states().values().stream().findFirst().orElse(null);
+    }
+
+    private static void execute(List<String> expressions, ControllerEnvironment environment) {
+        expressions.forEach(expression -> environment.compiledExpression(expression)
+                .evaluate(environment.expressions()));
+    }
+
+    private static boolean truth(double value) {
+        return Double.isFinite(value) && Math.abs(value) > EPSILON;
+    }
+
+    private static float finite(double value) {
+        return Double.isFinite(value) && Math.abs(value) <= Float.MAX_VALUE
+                ? (float) value : 0.0F;
+    }
+
+    private static String normalize(String name) {
+        return name == null ? "" : name.toLowerCase(Locale.ROOT);
+    }
+
+    private static String channelKey(String name) {
+        return normalize(name).replaceAll("_(\\d+)$", "$1");
+    }
+
+    private static boolean isBuiltin(AnimationController.State state) {
+        return state != null && BUILTIN_STATE.equals(state.name());
+    }
+
+    private static boolean isEmptyState(AnimationController.State state) {
+        return isBuiltin(state) || state.animations().isEmpty();
+    }
+
+    private static boolean isHandItemController(String name) {
+        String normalized = normalize(name);
+        return normalized.contains("pre_hold") || normalized.contains("post_hold")
+                || normalized.contains("pre_use") || normalized.contains("post_use")
+                || normalized.contains("pre_swing") || normalized.contains("post_swing");
+    }
+}
