@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "ysm_epicfight_compat",
+  "version": "${version}",
+  "name": "YSM Epic Fight Compat (Fabric port, WIP)",
+  "description": "Port tidak resmi: model Yes Steve Model (Fox Model Loader) memakai animasi combat Epic Fight. Tahap 2: belum teruji.",
+  "authors": [
+    "Asli: sakuraimikoto33 (MIT)",
+    "Port: pengguna"
+  ],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "net.okitsu.ysmepicfightcompat.fabric.CompatModFabric"
+    ],
+    "client": [
+      "net.okitsu.ysmepicfightcompat.fabric.CompatModFabricClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.21.1",
+    "java": ">=21",
+    "fabric-api": "*",
+    "epicfight": "*",
+    "yes_steve_model": "*"
+  }
+}

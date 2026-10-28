@@ -1,0 +1,84 @@
+package net.okitsu.ysmepicfightcompat.network.message;
+
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.okitsu.ysmepicfightcompat.fabric.shim.network.IPayloadContext;
+import net.okitsu.ysmepicfightcompat.CompatMod;
+import net.okitsu.ysmepicfightcompat.animation.MovementAnimationType;
+import net.okitsu.ysmepicfightcompat.network.HeldItemModelDisplayState;
+import net.okitsu.ysmepicfightcompat.network.MaidPreferenceDisplayState;
+import net.okitsu.ysmepicfightcompat.network.MovementAnimationPolicy;
+import net.okitsu.ysmepicfightcompat.network.RemoteMaidPreferences;
+
+import java.util.UUID;
+
+/** Server-authoritative maid inputs paired with owner-resolved cosmetic decisions. */
+public record MaidPreferenceSnapshotMessage(MaidPreferenceDisplayState state) implements CustomPacketPayload {
+    public static final Type<MaidPreferenceSnapshotMessage> TYPE = new Type<>(
+            ResourceLocation.fromNamespaceAndPath(CompatMod.MOD_ID, "maid_preference_snapshot"));
+    public static final StreamCodec<FriendlyByteBuf, MaidPreferenceSnapshotMessage> STREAM_CODEC =
+            StreamCodec.of((output, message) -> write(message, output), MaidPreferenceSnapshotMessage::read);
+
+    @Override
+    public Type<MaidPreferenceSnapshotMessage> type() {
+        return TYPE;
+    }
+
+    public MaidPreferenceSnapshotMessage {
+        if (state == null) {
+            throw new IllegalArgumentException("Missing maid preference snapshot");
+        }
+    }
+
+    public static void write(MaidPreferenceSnapshotMessage message,
+                             FriendlyByteBuf output) {
+        MaidPreferenceDisplayState state = message.state();
+        output.writeUUID(state.entityUuid());
+        output.writeUUID(state.ownerUuid());
+        output.writeVarLong(state.revision());
+        output.writeUtf(state.modelId(), MovementAnimationPolicy.MAX_MODEL_ID_LENGTH);
+        output.writeResourceLocation(state.mainHandItem());
+        output.writeResourceLocation(state.offHandItem());
+        output.writeByte(state.movement() == null ? -1 : state.movement().ordinal());
+        HeldItemModelDisplayState held = state.heldItems();
+        output.writeBoolean(held.mainHandYsm());
+        output.writeBoolean(held.offHandYsm());
+        output.writeBoolean(held.mainHandYsmSwitchAnimation());
+        output.writeBoolean(held.offHandYsmSwitchAnimation());
+        output.writeBoolean(state.ysmMovement());
+    }
+
+    public static MaidPreferenceSnapshotMessage read(FriendlyByteBuf input) {
+        UUID entityUuid = input.readUUID();
+        UUID ownerUuid = input.readUUID();
+        long revision = input.readVarLong();
+        String modelId = input.readUtf(MovementAnimationPolicy.MAX_MODEL_ID_LENGTH);
+        ResourceLocation mainHandItem = input.readResourceLocation();
+        ResourceLocation offHandItem = input.readResourceLocation();
+        int ordinal = input.readByte();
+        MovementAnimationType movement;
+        if (ordinal == -1) {
+            movement = null;
+        } else if (ordinal >= 0 && ordinal < MovementAnimationType.values().length) {
+            movement = MovementAnimationType.values()[ordinal];
+        } else {
+            throw new IllegalArgumentException("Invalid maid movement snapshot");
+        }
+        HeldItemModelDisplayState held = new HeldItemModelDisplayState(
+                input.readBoolean(), input.readBoolean(),
+                input.readBoolean(), input.readBoolean());
+        return new MaidPreferenceSnapshotMessage(new MaidPreferenceDisplayState(
+                entityUuid, ownerUuid, revision, modelId,
+                mainHandItem, offHandItem, movement, held, input.readBoolean()));
+    }
+
+    public static void receive(MaidPreferenceSnapshotMessage message,
+                               IPayloadContext context) {
+        if (context.flow() == PacketFlow.CLIENTBOUND) {
+            context.enqueueWork(() -> RemoteMaidPreferences.accept(message.state()));
+        }
+    }
+}
