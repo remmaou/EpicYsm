@@ -1,3 +1,0 @@
-net/okitsu/ysmepicfightcompat/config/ClientPreferences.java
-net/okitsu/ysmepicfightcompat/config/OptionalModConfig.java
-net/okitsu/ysmepicfightcompat/config/ServerPreferences.java
